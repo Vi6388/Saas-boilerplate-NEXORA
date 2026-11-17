@@ -18,10 +18,10 @@ export function initSentry(): void {
 
   const dsn = process.env.SENTRY_DSN_API;
 
-  if (!dsn) {
-    console.warn('SENTRY_DSN_API not set. Error tracking disabled.');
-    return;
-  }
+  // if (!dsn) {
+  //   console.warn('SENTRY_DSN_API not set. Error tracking disabled.');
+  //   return;
+  // }
 
   Sentry.init({
     dsn,

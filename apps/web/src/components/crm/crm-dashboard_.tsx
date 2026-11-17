@@ -1,0 +1,309 @@
+'use client';
+
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useRouter } from 'next/navigation';
+import { authClient, useSession, useActiveOrganization, useListOrganizations } from '@/lib/auth-client';
+
+type Customer = { id: string; name: string; company: string; email: string; phone: string; status: string; industry: string; createdAt: string };
+type Deal = { id: string; title: string; customerId: string; customer?: { name: string; company: string }; value: number; stage: string; probability: number; createdAt: string };
+type Task = { id: string; title: string; customerId?: string | null; customer?: { name: string } | null; priority: string; status: string; dueAt?: string | null };
+type Overview = { customers: number; activeCustomers: number; openDeals: number; pipelineValue: number; wonRevenue: number; completedTasks: number; tasksDue: number; monthly: { label: string; revenue: number; customers: number }[]; stages: { stage: string; count: number }[]; recentCustomers: Customer[]; recentDeals: Deal[] };
+type Section = 'Overview' | 'Customers' | 'Pipeline' | 'Tasks' | 'Analytics';
+type FormKind = 'customer' | 'deal' | 'task';
+type IconName = 'grid'|'users'|'briefcase'|'tasks'|'chart'|'plus'|'search'|'chevron'|'arrow'|'download'|'refresh'|'close'|'menu'|'spark'|'clock'|'check'|'filter'|'trending'|'more'|'shield'|'target'|'calendar'|'bolt';
+const sidebar: {name:Section;icon:IconName;description:string}[] = [
+  {name:'Overview',icon:'grid',description:'Business pulse'},
+  {name:'Customers',icon:'users',description:'Relationships'},
+  {name:'Pipeline',icon:'briefcase',description:'Revenue engine'},
+  {name:'Tasks',icon:'tasks',description:'Execution'},
+  {name:'Analytics',icon:'chart',description:'Insights'},
+];
+const stages = ['Lead','Qualified','Proposal','Negotiation','Won','Lost'] as const;
+const stageColors: Record<string,string> = {Lead:'#9a8edb',Qualified:'#5489ec',Proposal:'#ad7cdb',Negotiation:'#eab469',Won:'#47b99b',Lost:'#e27d89'};
+const nf = (n:number)=>new Intl.NumberFormat('en-US',{maximumFractionDigits:0}).format(n);
+const usd = (n:number)=>new Intl.NumberFormat('en-US',{style:'currency',currency:'USD',maximumFractionDigits:0}).format(n);
+const compact = (n:number)=>n>=1000000?`$${(n/1000000).toFixed(1)}m`:n>=1000?`$${(n/1000).toFixed(n%1000?1:0)}k`:usd(n);
+const shortDate = (s?:string|null)=>s?new Date(s).toLocaleDateString('en-US',{month:'short',day:'numeric'}):'Not set';
+const initials = (s:string)=>s.split(' ').filter(Boolean).slice(0,2).map(x=>x[0]?.toUpperCase()).join('')||'?';
+const avatarColors=['#e2dcff','#dcf2e9','#fce7d6','#e2eefd','#f8e1ec'];
+const defaultFields:Record<FormKind,Record<string,string>>={
+  customer:{name:'',company:'',email:'',phone:'',status:'Lead',industry:'Technology'},
+  deal:{title:'',customerId:'',value:'5000',stage:'Lead',probability:'25'},
+  task:{title:'',customerId:'',priority:'Medium',status:'Todo',dueAt:''},
+};
+
+function Icon({name,size=18,className=''}:{name:IconName;size?:number;className?:string}) {
+ const elements:Record<IconName,React.ReactNode>={
+  grid:<><rect x="3" y="3" width="7" height="7" rx="1.4"/><rect x="14" y="3" width="7" height="7" rx="1.4"/><rect x="3" y="14" width="7" height="7" rx="1.4"/><rect x="14" y="14" width="7" height="7" rx="1.4"/></>,
+  users:<><circle cx="9" cy="8" r="3"/><path d="M3.5 20v-2a5.5 5.5 0 0 1 11 0v2M17 5.5a3 3 0 0 1 0 6M17 15a5.5 5.5 0 0 1 4 5"/></>,
+  briefcase:<><rect x="3" y="7" width="18" height="14" rx="2"/><path d="M8 7V5a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2M3 13h18"/></>,
+  tasks:<><rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 10 2 2 4-4m2 2h3M7 17h11"/></>,
+  chart:<><path d="M4 20V12m5 8V4m5 16v-7m5 7V8"/></>,
+  plus:<path d="M12 5v14M5 12h14"/>,search:<><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></>,
+  chevron:<path d="m9 18 6-6-6-6"/>,arrow:<path d="M5 12h14m-6-6 6 6-6 6"/>,
+  download:<><path d="M12 3v12m-5-5 5 5 5-5M4 17v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3"/></>,
+  refresh:<><path d="M20 7v5h-5M4 17v-5h5"/><path d="M5 9a8 8 0 0 1 14-2l1 5M4 12l1 5a8 8 0 0 0 14-2"/></>,
+  close:<path d="M6 6 18 18M18 6 6 18"/>,menu:<path d="M4 6h16M4 12h16M4 18h16"/>,
+  spark:<><path d="m12 3 1.8 6.2L20 11l-6.2 1.8L12 19l-1.8-6.2L4 11l6.2-1.8L12 3ZM19 18l.5 1.5L21 20l-1.5.5L19 22l-.5-1.5L17 20l1.5-.5L19 18Z"/></>,
+  clock:<><circle cx="12" cy="12" r="9"/><path d="M12 7v5l4 2"/></>,check:<path d="m5 12 5 5 9-10"/>,
+  filter:<><path d="M4 7h16M7 12h10M10 17h4"/></>,trending:<path d="m4 17 6-6 4 4 6-8M15 7h5v5"/>,
+  more:<><circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/></>,
+  shield:<><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"/><path d="m9 12 2 2 4-4"/></>,
+  target:<><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1"/></>,
+  calendar:<><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M7 3v4M17 3v4M3 10h18"/></>,
+  bolt:<path d="m13 2-9 12h7l-1 8 10-12h-7l1-8Z"/>,
+ };
+ return <svg className={className} width={size} height={size} viewBox="0 0 24 24" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" fill="none" aria-hidden="true">{elements[name]}</svg>;
+}
+function Pill({label}:{label:string}) {const styles:Record<string,string>={Active:'bg-emerald-50 text-emerald-700 ring-emerald-100',Lead:'bg-slate-100 text-slate-600 ring-slate-200','At Risk':'bg-rose-50 text-rose-700 ring-rose-100',Qualified:'bg-blue-50 text-blue-700 ring-blue-100',Proposal:'bg-purple-50 text-purple-700 ring-purple-100',Negotiation:'bg-amber-50 text-amber-700 ring-amber-100',Won:'bg-emerald-50 text-emerald-700 ring-emerald-100',Lost:'bg-rose-50 text-rose-700 ring-rose-100',High:'bg-rose-50 text-rose-700 ring-rose-100',Medium:'bg-amber-50 text-amber-700 ring-amber-100',Low:'bg-slate-100 text-slate-600 ring-slate-200',Todo:'bg-slate-100 text-slate-600 ring-slate-200','In Progress':'bg-blue-50 text-blue-700 ring-blue-100',Done:'bg-emerald-50 text-emerald-700 ring-emerald-100'};
+ return <span className={`inline-flex items-center gap-1.5 whitespace-nowrap rounded-full px-2.5 py-1 text-[11px] font-semibold ring-1 ring-inset ${styles[label]||'bg-slate-100 text-slate-600 ring-slate-200'}`}><span className="h-1.5 w-1.5 rounded-full bg-current opacity-70"/>{label}</span>;
+}
+function SectionCard({title,caption,action,children,className=''}:{title:string;caption?:string;action?:React.ReactNode;children:React.ReactNode;className?:string}) {return <section className={`n-card ${className}`}><div className="flex flex-wrap items-start justify-between gap-3 px-6 pt-6 pb-4"><div><h3 className="text-[15px] font-bold tracking-tight text-slate-900">{title}</h3>{caption&&<p className="mt-1 text-xs text-slate-400">{caption}</p>}</div>{action}</div>{children}</section>}
+function TrendChart({data,field='revenue',small=false}:{data:Overview['monthly'];field?:'revenue'|'customers';small?:boolean}) {const values=data.length?data:[{label:'—',revenue:0,customers:0}];const peak=Math.max(1,...values.map(v=>v[field]));const width=580;const dx=values.length>1?500/(values.length-1):0;const coords=values.map((v,i)=>[40+i*dx,174-(v[field]/peak)*132]);const path=coords.map(([x,y],i)=>`${i?'L':'M'} ${x} ${y}`).join(' ');const filled=`${path} L ${coords[coords.length-1][0]} 174 L 40 174 Z`;return <svg viewBox="0 0 580 220" className={`w-full ${small?'h-36':'h-56'}`} role="img" aria-label={`${field==='revenue'?'Revenue':'Customer acquisition'} trend from CRM records`} preserveAspectRatio="none"><defs><linearGradient id={`nexora-fill-${field}`} x1="0" y1="0" x2="0" y2="1"><stop stopColor={field==='revenue'?'#7667f8':'#21b7a5'} stopOpacity=".22"/><stop offset="1" stopColor={field==='revenue'?'#7667f8':'#21b7a5'} stopOpacity="0"/></linearGradient></defs>{[42,86,130,174].map(y=><line key={y} x1="36" x2="560" y1={y} y2={y} stroke="#edf0f5" strokeDasharray="4 6"/>)}<path d={filled} fill={`url(#nexora-fill-${field})`}/><path d={path} fill="none" stroke={field==='revenue'?'#7564f6':'#18ad99'} strokeWidth="3.6" strokeLinecap="round" strokeLinejoin="round"/>{coords.map(([x,y],i)=><g key={i}><circle cx={x} cy={y} r="4" stroke={field==='revenue'?'#7564f6':'#18ad99'} strokeWidth="2.5" fill="white"/><text x={x} y="205" textAnchor="middle" fontSize="12" fill="#8991a4">{values[i].label}</text></g>)}</svg>}
+function Avatar({name,index=0}:{name:string;index?:number}) {return <span className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-xl text-xs font-extrabold text-slate-700" style={{background:avatarColors[index%avatarColors.length]}}>{initials(name)}</span>}
+function csvDownload(filename:string,rows:(string|number)[][]) {const text=rows.map(r=>r.map(c=>`"${String(c??'').replace(/"/g,'""')}"`).join(',')).join('\r\n');const url=URL.createObjectURL(new Blob(['\ufeff',text],{type:'text/csv;charset=utf-8;'}));const anchor=document.createElement('a');anchor.href=url;anchor.download=filename;anchor.click();URL.revokeObjectURL(url)}
+
+export function CrmDashboard():React.ReactNode {
+ const router=useRouter();
+ const {data:session,isPending}=useSession();
+  const {data:activeOrg,isPending:orgPending,refetch:refetchActiveOrganization}=useActiveOrganization();
+  const {data:availableOrgs,isPending:orgsPending}=useListOrganizations();
+  const [switchingOrg,setSwitchingOrg]=useState(false);
+  // Workspace changes must not invalidate the signed-in user session.
+  // Guard against concurrent selections and stale CRM responses.
+  const switchingRef = useRef(false);
+  const requestVersion = useRef(0);
+  const switchOrganization = async (organizationId: string) => {
+    if (!organizationId || organizationId === activeOrg?.id || switchingRef.current) return;
+    if (!availableOrgs?.some(org => org.id === organizationId)) {
+      setToast('');
+      setError('You do not have access to that organization.');
+      return;
+    }
+
+    switchingRef.current = true;
+    requestVersion.current += 1; // Ignore results from the previous workspace.
+    setSwitchingOrg(true);
+    setError('');
+    setToast('');
+
+    try {
+      const result = await authClient.organization.setActive({ organizationId });
+      if (result.error) {
+        throw new Error(result.error.message || 'Could not switch workspace');
+      }
+
+      // Do NOT reload the browser or force a second sign-in.
+      // Better Auth keeps the same authenticated session when setActive succeeds.
+      // Only refresh the active organization hook; refetching the entire session
+      // here can temporarily make useSession() appear signed out.
+      await refetchActiveOrganization();
+      setOverview(null);
+      setCustomers([]);
+      setDeals([]);
+      setTasks([]);
+      setQuery('');
+      setCustomerStatus('All');
+      setDealStage('All');
+      setToast('Workspace switched successfully');
+      // The effect below reloads data scoped to the new organization.
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Could not switch workspace');
+    } finally {
+      switchingRef.current = false;
+      setSwitchingOrg(false);
+    }
+  };
+ const [section,setSection]=useState<Section>('Overview');
+ const [overview,setOverview]=useState<Overview|null>(null);
+ const [customers,setCustomers]=useState<Customer[]>([]);
+ const [deals,setDeals]=useState<Deal[]>([]);
+ const [tasks,setTasks]=useState<Task[]>([]);
+ const [loading,setLoading]=useState(true);
+ const [error,setError]=useState('');
+ const [toast,setToast]=useState('');
+ const [query,setQuery]=useState('');
+ const [customerStatus,setCustomerStatus]=useState('All');
+ const [dealStage,setDealStage]=useState('All');
+ const [pipelineView,setPipelineView]=useState<'board'|'table'>('board');
+ const [period,setPeriod]=useState<'6 months'|'3 months'>('6 months');
+ const [modal,setModal]=useState<FormKind|null>(null);
+ const [editing,setEditing]=useState<string|null>(null);
+ const [form,setForm]=useState<Record<string,string>>({});
+ const [saving,setSaving]=useState(false);
+ const [sidebarOpen,setSidebarOpen]=useState(false);
+ const [seeding,setSeeding]=useState(false);
+ const [commandOpen,setCommandOpen]=useState(false);
+ const [commandQuery,setCommandQuery]=useState('');
+ const [focusMode,setFocusMode]=useState(false);
+ const [compactLayout,setCompactLayout]=useState(false);
+ const [accent,setAccent]=useState<'violet'|'ocean'|'emerald'>('violet');
+ useEffect(()=>{
+   const onKey=(event:KeyboardEvent)=>{
+     if((event.ctrlKey||event.metaKey)&&event.key.toLowerCase()==='k'){
+       event.preventDefault();setCommandOpen(v=>!v);
+     }
+     if(event.key==='Escape'){setCommandOpen(false);setFocusMode(false)}
+   };
+   window.addEventListener('keydown',onKey);
+   return ()=>window.removeEventListener('keydown',onKey);
+ },[]);
+ const apiBase=process.env.NEXT_PUBLIC_API_URL||'http://localhost:4000';
+ const request=useCallback(async(path:string,opts?:RequestInit)=>{const response=await fetch(`${apiBase}/api/crm${path}`,{...opts,cache: 'no-store',credentials:'include',headers:{'Content-Type':'application/json',...(opts?.headers||{})}});const payload=await response.json().catch(()=>({error:`HTTP ${response.status}`}));if(!response.ok)throw new Error(payload.error||payload.message||`HTTP ${response.status}`);return payload.data;},[apiBase]);
+ const reload = useCallback(async () => {
+   const version = ++requestVersion.current;
+   setLoading(true);
+   setError('');
+   try {
+     const [o, c, d, t] = await Promise.all([
+       request('/overview'),
+       request('/customers'),
+       request('/deals'),
+       request('/tasks'),
+     ]);
+     // Do not mix data returned by an earlier organization with the new one.
+     if (version !== requestVersion.current) return;
+     setOverview(o);
+     setCustomers(c);
+     setDeals(d);
+     setTasks(t);
+   } catch (e) {
+     if (version === requestVersion.current) {
+       setError(e instanceof Error ? e.message : 'Could not load workspace');
+     }
+   } finally {
+     if (version === requestVersion.current) setLoading(false);
+   }
+ }, [request]);
+ useEffect(()=>{if(!isPending&&!switchingOrg&&!session?.user)router.replace('/login')},[isPending,switchingOrg,session,router]);
+ useEffect(()=>{if(!orgPending&&!switchingOrg&&session?.user&&!activeOrg)router.replace('/onboarding')},[orgPending,switchingOrg,session,activeOrg,router]);
+ useEffect(()=>{if(!switchingOrg&&session?.user&&activeOrg?.id)void reload()},[switchingOrg,session?.user?.id,activeOrg?.id,reload]);
+ const filteredCustomers=useMemo(()=>customers.filter(c=>(customerStatus==='All'||c.status===customerStatus)&&`${c.name} ${c.company} ${c.email} ${c.industry}`.toLowerCase().includes(query.toLowerCase())),[customers,customerStatus,query]);
+ const filteredDeals=useMemo(()=>deals.filter(d=>(dealStage==='All'||d.stage===dealStage)&&`${d.title} ${d.customer?.name||''} ${d.customer?.company||''}`.toLowerCase().includes(query.toLowerCase())),[deals,dealStage,query]);
+ const activeValue=deals.filter(d=>!['Won','Lost'].includes(d.stage)).reduce((sum,d)=>sum+d.value*d.probability/100,0);
+ const won=deals.filter(d=>d.stage==='Won').length;
+ const closed=deals.filter(d=>['Won','Lost'].includes(d.stage)).length;
+ const winRate=closed?Math.round(won/closed*100):0;
+ const completed=tasks.filter(t=>t.status==='Done').length;
+ const taskProgress=tasks.length?Math.round(completed/tasks.length*100):0;
+ const overdue=tasks.filter(t=>t.status!=='Done'&&t.dueAt&&new Date(t.dueAt).getTime()<Date.now()).length;
+ const todayLabel=new Date().toLocaleDateString('en-US',{weekday:'long',month:'long',day:'numeric',year:'numeric'});
+ const activity=useMemo(()=>[...customers.map(c=>({id:'c'+c.id,when:c.createdAt,title:`${c.name} joined the customer directory`,detail:c.company,kind:'Customer'})),...deals.map(d=>({id:'d'+d.id,when:d.createdAt,title:d.title,detail:`${usd(d.value)} opportunity · ${d.stage}`,kind:'Deal'}))].sort((a,b)=>new Date(b.when).getTime()-new Date(a.when).getTime()).slice(0,6),[customers,deals]);
+ const commandResults=useMemo(()=>{
+   const term=commandQuery.trim().toLowerCase();
+   const entries=[
+     ...sidebar.map(s=>({key:'nav-'+s.name,title:s.name,detail:s.description,kind:'page' as const,id:s.name})),
+     ...customers.map(c=>({key:'customer-'+c.id,title:c.name,detail:c.company,kind:'customer' as const,id:c.id})),
+     ...deals.map(d=>({key:'deal-'+d.id,title:d.title,detail:d.customer?.company||'Opportunity',kind:'deal' as const,id:d.id})),
+     ...tasks.map(t=>({key:'task-'+t.id,title:t.title,detail:t.priority+' priority',kind:'task' as const,id:t.id})),
+   ];
+   return (term?entries.filter(e=>(e.title+' '+e.detail).toLowerCase().includes(term)):entries.filter(e=>e.kind==='page')).slice(0,9);
+ },[commandQuery,customers,deals,tasks]);
+ const monthly=period==='3 months'?(overview?.monthly||[]).slice(-3):(overview?.monthly||[]);
+ const switchSection=(s:Section)=>{setSection(s);setQuery('');setSidebarOpen(false);setError('')};
+ const openForm=(type:FormKind,item?:Customer|Deal|Task)=>{setModal(type);setEditing(item?.id||null);const defaults={...defaultFields[type]};if(type==='deal'&&!item)defaults.customerId=customers[0]?.id||'';const values=item?Object.fromEntries(Object.entries(item).filter(([,v])=>typeof v!=='object'||v===null).map(([k,v])=>[k,v===null?'':String(v)])):defaults;setForm(values);setError('')};
+ const save=async()=>{if(!modal)return;setSaving(true);setError('');try{const body={...form,...(modal==='deal'?{value:Number(form.value),probability:Number(form.probability)}:{}),...(modal==='task'?{customerId:form.customerId||null,dueAt:form.dueAt||null}:{})};await request(`/${modal}s${editing?`/${editing}`:''}`,{method:editing?'PATCH':'POST',body:JSON.stringify(body)});setModal(null);setToast(`${modal[0].toUpperCase()+modal.slice(1)} ${editing?'updated':'created'} successfully`);await reload()}catch(e){setError(e instanceof Error?e.message:'Save failed')}finally{setSaving(false)}};
+ const update=async(path:string,body:object)=>{try{await request(path,{method:'PATCH',body:JSON.stringify(body)});setToast('Changes saved');await reload()}catch(e){setError(e instanceof Error?e.message:'Update failed')}};
+ const remove=async(type:FormKind,id:string)=>{if(!window.confirm(`Delete this ${type}? This action cannot be undone.`))return;try{await request(`/${type}s/${id}`,{method:'DELETE'});setToast(`${type} deleted`);await reload()}catch(e){setError(e instanceof Error?e.message:'Delete failed')}};
+ const seed=async()=>{setSeeding(true);setError('');try{await request('/seed-demo',{method:'POST'});setToast('Sample CRM records added');await reload()}catch(e){setError(e instanceof Error?e.message:'Seed failed')}finally{setSeeding(false)}};
+ const exportSection=()=>{const name=`nexora-${section.toLowerCase()}-${new Date().toISOString().slice(0,10)}.csv`;if(section==='Customers')csvDownload(name,[['Name','Company','Email','Phone','Industry','Status'],...filteredCustomers.map(c=>[c.name,c.company,c.email,c.phone,c.industry,c.status])]);else if(section==='Pipeline')csvDownload(name,[['Opportunity','Customer','Value (USD)','Stage','Probability (%)'],...filteredDeals.map(d=>[d.title,d.customer?.name||'',d.value,d.stage,d.probability])]);else if(section==='Tasks')csvDownload(name,[['Task','Customer','Priority','Status','Due date'],...tasks.map(t=>[t.title,t.customer?.name||'',t.priority,t.status,t.dueAt||''])]);else csvDownload(name,[['Metric','Value'],['Total customers',overview?.customers||0],['Pipeline value',overview?.pipelineValue||0],['Weighted pipeline',Math.round(activeValue)],['Won revenue',overview?.wonRevenue||0],['Win rate',`${winRate}%`]]);setToast('CSV report downloaded')};
+ if(isPending||orgPending||switchingOrg||!session?.user||!activeOrg)return <div className="flex min-h-screen items-center justify-center bg-[#f6f8fc] text-slate-600">Opening your workspace…</div>;
+ const kpis=[{name:'Total customers',value:nf(overview?.customers||0),detail:`${nf(overview?.activeCustomers||0)} active relationships`,icon:'users' as IconName,color:'violet',label:'Customer growth'},{name:'Open pipeline',value:compact(overview?.pipelineValue||0),detail:`${overview?.openDeals||0} live opportunities`,icon:'briefcase' as IconName,color:'blue',label:'Revenue potential'},{name:'Revenue won',value:compact(overview?.wonRevenue||0),detail:`${won} successfully closed`,icon:'trending' as IconName,color:'green',label:'Closed-won revenue'},{name:'Team execution',value:`${taskProgress}%`,detail:`${completed} of ${tasks.length} tasks completed`,icon:'check' as IconName,color:'orange',label:'Task completion'}];
+ return <div data-accent={accent} className={`nexora-shell nexora-signature min-h-screen bg-[#f5f7fb] text-slate-800 ${focusMode?'n-focus-mode':''} ${compactLayout?'n-compact':''}`}>
+  <style>{`
+  .nexora-shell{font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;letter-spacing:-.01em}.nexora-shell .n-card{background:#fff;border:1px solid #e8edf4;border-radius:20px;box-shadow:0 4px 24px rgba(30,40,80,.035)}.nexora-shell .n-btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;border-radius:11px;padding:10px 14px;font-size:12px;font-weight:700;transition:all .15s}.nexora-shell .n-primary{background:#6655eb;color:white;box-shadow:0 5px 12px #6655eb28}.nexora-shell .n-primary:hover{background:#5340cf;transform:translateY(-1px)}.nexora-shell .n-secondary{border:1px solid #e2e7f0;background:#fff;color:#3d4960}.nexora-shell .n-secondary:hover{background:#f4f6fb}.nexora-shell .n-input{width:100%;border:1px solid #e1e7ef;background:#fff;border-radius:10px;padding:10px 12px;font-size:12px;color:#364152;outline:none}.nexora-shell .n-input:focus{border-color:#8072f4;box-shadow:0 0 0 3px #7968f21a}.nexora-shell .n-table{width:100%;border-collapse:collapse;white-space:nowrap;font-size:12px}.nexora-shell .n-table th{text-align:left;background:#f9fafc;border-top:1px solid #eff1f5;border-bottom:1px solid #eff1f5;color:#8490a2;font-size:10px;font-weight:750;text-transform:uppercase;letter-spacing:.08em;padding:13px 19px}.nexora-shell .n-table td{padding:15px 19px;border-bottom:1px solid #f0f2f6;color:#536077}.nexora-shell .n-table tr:last-child td{border-bottom:none}.nexora-shell .n-table tbody tr:hover{background:#fbfcff}.nexora-shell .n-small{font-size:11px;color:#8b95a6}.nexora-shell .n-kpi-violet{background:#f0edff;color:#7162e9}.nexora-shell .n-kpi-blue{background:#eaf1ff;color:#5183eb}.nexora-shell .n-kpi-green{background:#e7f8f1;color:#20a78c}.nexora-shell .n-kpi-orange{background:#fff4e8;color:#db9b4a}@keyframes nEnter{from{opacity:.65;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}.nexora-shell main{animation:nEnter .2s ease}.nexora-shell button:disabled{cursor:not-allowed;opacity:.5}.nexora-shell .n-scroll::-webkit-scrollbar{width:5px;height:5px}.nexora-shell .n-scroll::-webkit-scrollbar-thumb{background:#d6dbe6;border-radius:10px}
+  `}</style>
+  <style>{`
+  /* Nexora Signature: premium presentation system */
+  .nexora-signature{--n-accent:#6755eb;--n-accent-soft:#f1eeff;--n-deep:#091428;--n-line:#e7eaf1;--n-glow:rgba(94,77,210,.12);background:radial-gradient(ellipse 65% 45% at 88% -12%,rgba(199,192,253,.17),transparent 75%),#f6f8fc!important}
+  .nexora-signature[data-accent="ocean"]{--n-accent:#147cba;--n-accent-soft:#e9f5ff;--n-glow:rgba(21,124,186,.12)}
+  .nexora-signature[data-accent="emerald"]{--n-accent:#148b78;--n-accent-soft:#e8f8f3;--n-glow:rgba(20,139,120,.12)}
+  .nexora-signature .n-card{border-color:var(--n-line);border-radius:18px;box-shadow:0 8px 25px rgba(23,38,65,.035),0 1px 3px rgba(23,38,65,.035);transition:border-color .2s,box-shadow .2s,transform .2s}
+  .nexora-signature .n-card:hover{border-color:#d8ddef;box-shadow:0 14px 35px rgba(23,38,65,.075)}
+  .nexora-signature .n-primary{background:var(--n-accent);box-shadow:0 8px 18px var(--n-glow)}
+  .nexora-signature .n-primary:hover{background:var(--n-accent);filter:brightness(.91)}
+  .nexora-signature .n-input:focus{border-color:var(--n-accent);box-shadow:0 0 0 3px var(--n-glow)}
+  .nexora-signature .n-search-trigger{display:flex;align-items:center;gap:8px;min-width:180px;border:1px solid #e6eaf2;background:#f8f9fc;border-radius:11px;padding:9px 11px;color:#8390a5;font-size:12px;font-weight:600;transition:.2s}
+  .nexora-signature .n-search-trigger:hover{background:white;border-color:#c9d0e1;color:#344158}
+  .nexora-signature .n-search-trigger kbd{margin-left:auto;border:1px solid #dfe3ec;background:white;padding:2px 5px;border-radius:5px;font-size:10px;font-family:inherit}
+  .nexora-signature .n-spotlight{animation:nEnter .16s ease}
+  .nexora-signature .n-command-item:hover,.nexora-signature .n-command-item:focus-visible{outline:0;background:#f4f2ff}
+  .nexora-signature .n-overline{font-size:10px;letter-spacing:.17em;font-weight:800;text-transform:uppercase;color:#79879f}
+  .nexora-signature .n-hero{position:relative;isolation:isolate;background:linear-gradient(115deg,#0b1630,#152847 55%,#182b50)!important;border:1px solid rgba(255,255,255,.09);box-shadow:0 25px 55px rgba(15,27,57,.15);overflow:hidden}
+  .nexora-signature .n-hero:before{content:'';position:absolute;inset:-30% -14% auto auto;width:520px;height:370px;background:radial-gradient(circle,rgba(128,110,255,.34),transparent 67%);z-index:-1;pointer-events:none}
+  .nexora-signature .n-hero:after{content:'';position:absolute;right:8%;bottom:-95px;width:270px;height:270px;border:1px solid rgba(255,255,255,.1);border-radius:50%;box-shadow:0 0 0 50px rgba(255,255,255,.02),0 0 0 102px rgba(255,255,255,.02);pointer-events:none;z-index:-1}
+  .nexora-signature .n-stat-ring{background:conic-gradient(var(--n-accent) var(--ring),#eaecf5 var(--ring));border-radius:50%;padding:8px}
+  .nexora-signature .n-stat-ring>div{background:white;border-radius:50%}
+  .nexora-signature .n-enterprise-sidebar{background:linear-gradient(168deg,#0a1427 0%,#121d38 55%,#131f3c 100%)!important;border-right:1px solid #34425b}
+  .nexora-signature .n-brand-mark{background:linear-gradient(145deg,#bbafff,#7d6cef 48%,#4a60cd)!important;transform:rotate(-4deg);border:1px solid #ffffff44}
+  .nexora-signature .n-enterprise-header{box-shadow:0 1px 0 #e9edf4;background:rgba(255,255,255,.92)!important}
+  .nexora-signature .n-accent-dot{box-shadow:0 0 0 4px var(--n-accent-soft);background:var(--n-accent)}
+  .nexora-signature .n-secondary{transition:.2s}
+  .nexora-signature .n-secondary:hover{border-color:#c6cee0;transform:translateY(-1px)}
+  .nexora-signature .n-table tbody tr{transition:background .12s}
+  .nexora-signature .n-table tbody tr:hover{background:#f7f7ff}
+  .nexora-signature .n-feature-card{border:1px solid #e6e9f2;border-radius:17px;background:linear-gradient(130deg,#fff,#f8f9ff);padding:20px}
+  .nexora-signature .n-feature-card strong{display:block;font-size:22px;color:#1a2843;letter-spacing:-.04em;margin-top:6px}
+  .nexora-signature .n-compact .n-card{border-radius:12px}
+  .nexora-signature.n-compact main{max-width:1700px}
+  .nexora-signature.n-focus-mode aside{display:none!important}
+  .nexora-signature.n-focus-mode>div.min-h-screen{padding-left:0!important}
+  .nexora-signature.n-focus-mode header{display:none!important}
+  .nexora-signature.n-focus-mode main{max-width:1700px;padding-top:32px}
+  @media(max-width:740px){.nexora-signature .n-search-trigger{min-width:0}.nexora-signature .n-search-trigger span,.nexora-signature .n-search-trigger kbd{display:none}.nexora-signature .n-hero:after{display:none}}
+  @media(prefers-reduced-motion:reduce){.nexora-signature *, .nexora-signature *:before,.nexora-signature *:after{animation:none!important;transition:none!important}}
+`}</style>
+   {focusMode&&<button onClick={()=>setFocusMode(false)} className="fixed right-5 top-4 z-[65] rounded-xl border border-[#dce1ea] bg-white px-4 py-2 text-xs font-bold text-slate-700 shadow-lg">Exit presentation <span className="ml-2 text-slate-400">Esc</span></button>}
+   {sidebarOpen&&<button aria-label="Close navigation" className="fixed inset-0 z-40 bg-[#10192b]/50 lg:hidden" onClick={()=>setSidebarOpen(false)}/>}
+  <aside className={`n-enterprise-sidebar fixed inset-y-0 left-0 z-50 flex w-[248px] flex-col overflow-y-auto bg-[#111b30] text-white transition-transform lg:translate-x-0 ${sidebarOpen?'translate-x-0':'-translate-x-full'}`}>
+   <div className="flex h-[89px] items-center gap-3 border-b border-white/10 px-6"><div className="grid h-11 w-11 place-items-center n-brand-mark rounded-xl bg-gradient-to-br from-[#9185ff] via-[#7566eb] to-[#5845d8] text-xl font-black shadow-lg shadow-indigo-900/30">N</div><div><p className="text-lg font-black tracking-[.13em]">NEXORA</p><p className="text-[10px] font-medium tracking-[.15em] text-[#8290ab]">BUSINESS SUITE</p></div></div>
+   <div className="mx-4 mt-6 rounded-xl border border-white/10 bg-white/[.045] p-3">
+     <label htmlFor="nexora-workspace-switcher" className="block text-[10px] font-semibold uppercase tracking-widest text-[#8896ae]">Current workspace</label>
+     <div className="mt-2 flex items-center gap-2">
+      <div className="grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-[#6558dd] text-xs font-bold">{initials(activeOrg.name)}</div>
+      <select
+       id="nexora-workspace-switcher"
+       aria-label="Switch organization"
+       className="min-w-0 flex-1 cursor-pointer rounded-lg border border-white/15 bg-[#1b2944] px-2 py-2 text-xs font-bold text-white outline-none focus:ring-2 focus:ring-violet-400 disabled:cursor-wait disabled:opacity-60"
+       value={activeOrg.id}
+       onChange={e=>void switchOrganization(e.target.value)}
+       disabled={switchingOrg || orgsPending || !availableOrgs?.length}
+      >
+       {!availableOrgs?.some(org=>org.id===activeOrg.id)&&<option value={activeOrg.id}>{activeOrg.name}</option>}
+       {(availableOrgs||[]).map(org=><option key={org.id} value={org.id}>{org.name}</option>)}
+      </select>
+     </div>
+     {switchingOrg&&<p role="status" className="mt-2 text-[10px] text-[#b6b0ff]">Switching workspace…</p>}
+     {!orgsPending&&availableOrgs?.length===1&&<p className="mt-2 text-[10px] leading-4 text-[#9eabc2]">Only one organization is available to this account.</p>}
+    </div>
+   <p className="mt-8 px-7 text-[10px] font-bold uppercase tracking-[.18em] text-[#667691]">Workspace</p>
+   <nav aria-label="Dashboard navigation" className="mt-3 space-y-1 px-3">{sidebar.map(s=><button key={s.name} onClick={()=>switchSection(s.name)} className={`group flex w-full items-center gap-3 rounded-xl px-4 py-3 text-left transition ${section===s.name?'bg-[#6658de] text-white shadow-lg shadow-[#040a17]/15':'text-[#9eadc4] hover:bg-white/[.065] hover:text-white'}`}><Icon name={s.icon} size={18}/><span className="flex-1 text-[13px] font-semibold">{s.name}</span>{section===s.name&&<span className="h-1.5 w-1.5 rounded-full bg-white"/>}</button>)}</nav>
+   <div className="mx-4 mt-auto mb-5 pt-8"><div className="rounded-2xl border border-[#3f4669] bg-gradient-to-br from-[#303b60] to-[#1f2d48] p-4"><div className="flex items-center gap-2 text-xs font-bold text-[#eeefff]"><Icon name="shield" size={16}/> Workspace protected</div><p className="mt-2 text-[11px] leading-5 text-[#9eabc2]">Your CRM records stay scoped to your organization in PostgreSQL.</p></div><div className="mt-5 px-2 text-[10px] text-[#697d99]">Nexora Signature · Enterprise UI</div></div>
+  </aside>
+  <div className="min-h-screen lg:pl-[248px]">
+   <header className="n-enterprise-header sticky top-0 z-30 flex h-[76px] items-center justify-between gap-3 border-b border-[#e8ebf2] bg-white/95 px-5 backdrop-blur-xl md:px-9"><div className="flex min-w-0 items-center gap-3"><button aria-label="Open navigation" className="rounded-lg border border-slate-200 p-2 lg:hidden" onClick={()=>setSidebarOpen(true)}><Icon name="menu"/></button><span className="hidden text-xs font-semibold text-[#a0a9b7] sm:block">Workspace</span><Icon name="chevron" size={14} className="hidden text-[#a9b1bd] sm:block"/><span className="truncate text-xs font-bold text-slate-700">{section}</span></div><div className="flex items-center gap-3"><button className="n-search-trigger" onClick={()=>{setCommandQuery('');setCommandOpen(true)}} aria-label="Search workspace"><Icon name="search" size={15}/><span>Search workspace</span><kbd>Ctrl K</kbd></button><button className="n-btn n-secondary hidden md:inline-flex" onClick={()=>setFocusMode(v=>!v)} title="Toggle presentation focus mode">{focusMode?'Exit focus':'Present'} <Icon name="spark" size={14}/></button><div className="hidden items-center gap-1 rounded-xl border border-[#e4e8f1] bg-[#f7f8fb] p-1 xl:flex" aria-label="Color theme">{(['violet','ocean','emerald'] as const).map(color=><button key={color} onClick={()=>setAccent(color)} aria-label={`${color} accent`} aria-pressed={accent===color} className={`h-5 w-5 rounded-full border-2 ${accent===color?'border-[#1b2840] scale-110':'border-white'}`} style={{background:color==='violet'?'#7667e8':color==='ocean'?'#1688bd':'#1a9b7d'}} />)}</div><div className="hidden items-center gap-2 rounded-full bg-emerald-50 px-3 py-1.5 text-[10px] font-bold text-emerald-700 sm:flex"><span className="h-1.5 w-1.5 rounded-full bg-emerald-500"/> System online</div><button onClick={()=>void reload()} className="n-btn n-secondary" title="Refresh dashboard" aria-label="Refresh dashboard"><Icon name="refresh" size={16}/></button><div className="h-8 w-px bg-[#e5e9f1]"/><Avatar name={session.user.name||'Account'} index={3}/><div className="hidden sm:block"><div className="max-w-[130px] truncate text-xs font-bold">{session.user.name||'Account'}</div><div className="text-[10px] text-[#9da5b1]">Workspace member</div></div></div></header>
+   <main className="mx-auto max-w-[1540px] px-4 py-6 md:px-9 md:py-8">
+    <div className="mb-6 flex flex-wrap items-center justify-between gap-4"><div><p className="mb-2 text-[11px] font-bold uppercase tracking-[.18em] text-[#7e70e5]">{section==='Overview'?'Workspace / Executive summary':`Workspace / ${section}`}</p><h1 className="text-[28px] font-extrabold tracking-[-.04em] text-[#17243b] md:text-[33px]">{section==='Overview'?'Executive command center':section==='Pipeline'?'Sales pipeline':section==='Analytics'?'Performance insights':section==='Customers'?'Customer relationships':'Team execution'}</h1><p className="mt-1 text-xs text-[#8491a3]">{section==='Overview'?todayLabel:section==='Customers'?'Manage your customers and the relationships that matter.':section==='Pipeline'?'Track and advance revenue opportunities with confidence.':section==='Tasks'?'Stay aligned and keep important work moving.':'Turn real business activity into actionable insights.'}</p></div><div className="flex flex-wrap gap-2"><button className="n-btn n-secondary" onClick={exportSection}><Icon name="download" size={15}/> Export report</button><button className="n-btn n-primary" onClick={()=>openForm(section==='Pipeline'?'deal':section==='Tasks'?'task':'customer')}><Icon name="plus" size={16}/> {section==='Pipeline'?'New deal':section==='Tasks'?'New task':'Add customer'}</button></div></div>
+    {error&&!modal&&<div role="alert" className="mb-5 flex items-center justify-between gap-3 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-xs font-semibold text-rose-700"><span>{error}</span><button onClick={()=>setError('')}><Icon name="close" size={16}/></button></div>}
+    {toast&&<div role="status" className="mb-5 flex items-center justify-between gap-3 rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-xs font-semibold text-emerald-800"><span className="flex items-center gap-2"><Icon name="check" size={16}/>{toast}</span><button onClick={()=>setToast('')}><Icon name="close" size={16}/></button></div>}
+    {!loading&&section==='Overview'&&<div className="mb-5 grid gap-3 md:grid-cols-3"><div className="n-feature-card flex items-center justify-between gap-3"><div><p className="n-overline">Projected pipeline</p><strong>{compact(activeValue)}</strong><p className="mt-1 text-[11px] text-slate-500">Probability-weighted open deals</p></div><div className="grid h-12 w-12 place-items-center rounded-2xl bg-[#eeebff] text-[#7365e5]"><Icon name="target" size={23}/></div></div><div className="n-feature-card flex items-center justify-between gap-3"><div><p className="n-overline">Conversion quality</p><strong>{winRate}%</strong><p className="mt-1 text-[11px] text-slate-500">Closed deals won</p></div><div className="n-stat-ring" style={{'--ring':`${winRate}%`} as React.CSSProperties}><div className="grid h-11 w-11 place-items-center"><Icon name="trending" size={19}/></div></div></div><div className="n-feature-card flex items-center justify-between gap-3"><div><p className="n-overline">Needs attention</p><strong>{overdue} <span className="text-sm font-semibold text-slate-400">overdue</span></strong><p className="mt-1 text-[11px] text-slate-500">Open tasks beyond due date</p></div><button onClick={()=>switchSection('Tasks')} className="rounded-xl border border-[#e4e8f1] bg-white p-3 text-[#6a7790]" aria-label="View overdue tasks"><Icon name="arrow" size={18}/></button></div></div>}
+    {loading?<div className="n-card p-16 text-center text-sm text-slate-500">Loading your business data…</div>:<>
+     {section==='Overview'&&<>
+      <div className="n-hero mb-6 overflow-hidden rounded-[22px] bg-[#192642] text-white shadow-xl shadow-[#192642]/10"><div className="relative flex flex-wrap items-center justify-between gap-6 px-7 py-7 md:px-9"><div className="relative z-10 max-w-xl"><span className="inline-flex items-center gap-2 rounded-full border border-white/15 bg-white/10 px-3 py-1.5 text-[10px] font-semibold tracking-wide text-[#d9dbff]"><Icon name="spark" size={13}/> NEXORA · EXECUTIVE INTELLIGENCE</span><h2 className="mt-4 text-2xl font-extrabold leading-tight tracking-tight md:text-[29px]">Build momentum. Close deals.<br/><span className="text-[#ac9bff]">Lead with confidence.</span></h2><p className="mt-3 max-w-md text-xs leading-6 text-[#b5bed2]">Your customers, opportunities and tasks—organized in one actionable workspace.</p><button onClick={()=>switchSection('Pipeline')} className="mt-5 flex items-center gap-2 text-xs font-bold text-[#cfcbff] hover:text-white">Explore sales pipeline <Icon name="arrow" size={14}/></button></div><div aria-hidden="true" className="relative hidden h-[165px] w-[280px] items-end gap-2 md:flex"><div className="absolute inset-0 rounded-full bg-[#6554f5]/20 blur-[45px]"/>{[34,55,42,72,60,87,72,99,84,115,104,140].map((h,i)=><div key={i} style={{height:`${h}%`}} className={`relative z-10 w-5 rounded-t-md ${i===11?'bg-[#ad9cff]':'bg-gradient-to-t from-[#6555c4]/10 to-[#8173f3]/80'}`}/>)}</div></div></div>
+      {!customers.length&&<div className="mb-6 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-violet-200 bg-violet-50 p-5"><div><p className="text-sm font-bold text-[#513f9b]">Make this workspace presentation-ready</p><p className="mt-1 text-xs text-[#8578ae]">Load fictional customer, deal and task records to explore the full experience.</p></div><button onClick={()=>void seed()} disabled={seeding} className="n-btn n-primary">{seeding?'Loading…':'Load sample data'} <Icon name="arrow" size={14}/></button></div>}
+      <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">{kpis.map(k=><div key={k.name} className="n-card relative overflow-hidden p-5 md:p-6"><div className="flex items-center justify-between"><span className="text-xs font-semibold text-[#7d899c]">{k.name}</span><span className={`grid h-10 w-10 place-items-center rounded-xl n-kpi-${k.color}`}><Icon name={k.icon} size={19}/></span></div><p className="mt-3 text-[29px] font-extrabold tracking-tight text-[#1b2840]">{k.value}</p><div className="mt-3 flex items-center gap-2 text-[11px] text-[#8591a2]"><span className="text-[#33a78e]"><Icon name="trending" size={14}/></span>{k.detail}</div><div className="absolute right-0 bottom-0 h-1 w-20 rounded-l-full bg-[#e9e5ff]"/></div>)}</div>
+      <div className="mt-5 grid gap-5 xl:grid-cols-[1.75fr_1fr]"><SectionCard title="Revenue performance" caption="Closed-won revenue over the last six months" action={<span className="rounded-lg bg-[#f4f1ff] px-3 py-2 text-[10px] font-bold text-[#7766dc]">USD · Monthly</span>}><div className="px-5 pb-3"><TrendChart data={overview?.monthly||[]}/></div></SectionCard><SectionCard title="Revenue pipeline" caption="Opportunities by current stage"><div className="space-y-4 px-6 pb-7">{stages.slice(0,5).map(stage=>{const count=deals.filter(d=>d.stage===stage).length;const total=deals.length||1;return <div key={stage}><div className="mb-1.5 flex justify-between text-xs"><span className="font-semibold text-[#5e687a]">{stage}</span><span className="font-bold text-[#22314c]">{count}</span></div><div className="h-2.5 rounded-full bg-[#f0f2f7]"><div className="h-2.5 rounded-full" style={{width:`${count/total*100}%`,background:stageColors[stage]}}/></div></div>})}<button onClick={()=>switchSection('Pipeline')} className="flex items-center gap-1 text-xs font-bold text-[#7462e4]">View opportunities <Icon name="arrow" size={13}/></button></div></SectionCard></div>
+      <div className="mt-5 grid gap-5 xl:grid-cols-[1.2fr_1fr]"><SectionCard title="Priority actions" caption="Tasks that need attention"><div className="px-6 pb-6">{tasks.filter(t=>t.status!=='Done').slice(0,4).map((t,i)=><div key={t.id} className="flex items-center gap-3 border-b border-[#f1f2f6] py-3 last:border-b-0"><span className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-[#f2efff] text-[#7869db]"><Icon name="tasks" size={16}/></span><div className="min-w-0 flex-1"><p className="truncate text-xs font-bold text-[#283750]">{t.title}</p><p className="mt-1 text-[10px] text-[#99a2b1]">{t.customer?.name||'General workspace'} · {shortDate(t.dueAt)}</p></div><Pill label={t.priority}/></div>)}{!tasks.some(t=>t.status!=='Done')&&<p className="py-8 text-center text-xs text-[#9ba4b3]">Nothing urgent right now.</p>}<button onClick={()=>switchSection('Tasks')} className="mt-2 text-xs font-bold text-[#7562e8]">Open task board →</button></div></SectionCard><SectionCard title="Recent activity" caption="Latest CRM records"><div className="space-y-4 px-6 pb-6">{activity.slice(0,4).map((event,i)=><div key={event.id} className="flex items-start gap-3"><span className="mt-0.5 grid h-8 w-8 shrink-0 place-items-center rounded-full bg-[#eef0ff] text-[#776be0]"><Icon name={event.kind==='Deal'?'briefcase':'users'} size={14}/></span><div className="min-w-0"><p className="truncate text-xs font-bold text-[#364057]">{event.title}</p><p className="mt-1 truncate text-[11px] text-[#98a1b0]">{event.detail}</p></div><span className="ml-auto shrink-0 text-[10px] text-[#a0a8b5]">{shortDate(event.when)}</span></div>)}{!activity.length&&<p className="py-8 text-center text-xs text-[#9ba4b3]">Your recent activity will show here.</p>}</div></SectionCard></div>
+     </>}
+     {section==='Customers'&&<><div className="mb-5 grid gap-4 md:grid-cols-3">{[['All customers',customers.length,'users'],['Active relationships',customers.filter(c=>c.status==='Active').length,'check'],['Need attention',customers.filter(c=>c.status==='At Risk').length,'target']].map(([label,count,icon])=><div key={label} className="n-card flex items-center justify-between p-5"><div><div className="text-[11px] font-semibold text-[#8a95a5]">{label}</div><div className="mt-1 text-2xl font-extrabold text-slate-800">{count}</div></div><div className="rounded-xl bg-[#f3f1ff] p-3 text-[#7769e6]"><Icon name={icon as IconName}/></div></div>)}</div><SectionCard title="Customer directory" caption={`${filteredCustomers.length} matching contacts · All records are organization scoped`} action={<div className="flex flex-wrap gap-2"><div className="relative"><Icon className="absolute left-3 top-2.5 text-slate-400" name="search" size={16}/><input className="n-input max-w-[200px] pl-9" value={query} onChange={e=>setQuery(e.target.value)} placeholder="Search customers" aria-label="Search customers"/></div><select className="n-input w-auto" aria-label="Filter customer status" value={customerStatus} onChange={e=>setCustomerStatus(e.target.value)}>{['All','Lead','Active','At Risk'].map(s=><option key={s}>{s}</option>)}</select></div>}><div className="overflow-x-auto n-scroll"><table className="n-table"><thead><tr><th>Contact</th><th>Company</th><th>Industry</th><th>Status</th><th>Phone</th><th>Actions</th></tr></thead><tbody>{filteredCustomers.map((c,i)=><tr key={c.id}><td><div className="flex items-center gap-3"><Avatar name={c.name} index={i}/><div><p className="font-bold text-[#344158]">{c.name}</p><p className="mt-1 text-[10px] text-[#99a3b2]">{c.email}</p></div></div></td><td className="font-semibold">{c.company||'—'}</td><td>{c.industry||'—'}</td><td><Pill label={c.status}/></td><td>{c.phone||'—'}</td><td><div className="flex gap-2"><button onClick={()=>openForm('customer',c)} className="font-semibold text-[#705fe5]">Edit</button><button onClick={()=>void remove('customer',c.id)} className="font-semibold text-[#c47989]">Delete</button></div></td></tr>)}{!filteredCustomers.length&&<tr><td colSpan={6} className="py-12 text-center">No matching customers. Add a new customer to get started.</td></tr>}</tbody></table></div></SectionCard></>}
+     {section==='Pipeline'&&<><div className="mb-5 grid gap-4 sm:grid-cols-2 xl:grid-cols-4">{[['Pipeline value',compact(overview?.pipelineValue||0)],['Weighted forecast',compact(activeValue)],['Deals won',String(won)],['Win rate',`${winRate}%`]].map(([label,value])=><div key={label} className="n-card p-5"><p className="text-xs text-[#919cac]">{label}</p><p className="mt-2 text-[27px] font-extrabold text-[#1b2840]">{value}</p></div>)}</div><div className="mb-5 flex flex-wrap items-center justify-between gap-3"><div className="relative"><Icon name="search" size={16} className="absolute left-3 top-3 text-[#a5adbb]"/><input className="n-input min-w-[230px] pl-9" value={query} onChange={e=>setQuery(e.target.value)} placeholder="Search opportunities" aria-label="Search opportunities"/></div><div className="flex items-center gap-2"><select className="n-input w-auto" value={dealStage} onChange={e=>setDealStage(e.target.value)} aria-label="Filter deal stages">{['All',...stages].map(s=><option key={s}>{s}</option>)}</select><div className="flex rounded-xl border border-[#e2e7ef] bg-white p-1"><button onClick={()=>setPipelineView('board')} className={`rounded-lg px-3 py-2 text-[11px] font-bold ${pipelineView==='board'?'bg-[#efecff] text-[#6f5de1]':'text-[#8f99aa]'}`}>Board</button><button onClick={()=>setPipelineView('table')} className={`rounded-lg px-3 py-2 text-[11px] font-bold ${pipelineView==='table'?'bg-[#efecff] text-[#6f5de1]':'text-[#8f99aa]'}`}>Table</button></div></div></div>{pipelineView==='board'?<div className="n-scroll grid grid-cols-1 gap-4 overflow-x-auto pb-3 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-6">{stages.map(stage=>{const items=filteredDeals.filter(d=>d.stage===stage);return <div key={stage} className="min-w-[185px] rounded-2xl border border-[#e5eaf1] bg-[#eef1f7]/70 p-3"><div className="mb-4 flex items-center justify-between gap-2"><div className="flex items-center gap-2"><span className="h-2 w-2 rounded-full" style={{background:stageColors[stage]}}/><span className="text-xs font-bold text-[#4e5a70]">{stage}</span></div><span className="rounded-lg bg-white px-2 py-1 text-[10px] font-bold text-slate-500">{items.length}</span></div><div className="space-y-3">{items.map(d=><div key={d.id} className="rounded-xl border border-[#e8eaf1] bg-white p-3 shadow-sm"><div className="mb-3 flex items-center justify-between"><span className="text-[10px] font-semibold text-[#9ca5b4]">{d.customer?.company||'Opportunity'}</span><button title="Edit deal" className="text-[#a0a7b5]" onClick={()=>openForm('deal',d)}><Icon name="more" size={17}/></button></div><p className="min-h-[42px] text-xs font-bold leading-5 text-[#26364d]">{d.title}</p><p className="mt-3 text-base font-extrabold text-[#25334d]">{usd(d.value)}</p><div className="mt-3 flex items-center justify-between border-t border-[#f1f2f6] pt-3"><span className="text-[10px] text-[#9ca5b2]">{d.probability}% likely</span><select className="max-w-[112px] rounded-md bg-[#f6f7fb] px-1 py-1 text-[10px] text-[#656f83]" aria-label={`Move ${d.title} to stage`} value={d.stage} onChange={e=>void update(`/deals/${d.id}`,{stage:e.target.value})}>{stages.map(s=><option key={s}>{s}</option>)}</select></div></div>)}{!items.length&&<div className="rounded-xl border border-dashed border-[#d7dfeb] px-2 py-7 text-center text-[11px] text-[#a4adbc]">No opportunities</div>}</div></div>})}</div>:<SectionCard title="All opportunities" caption="Track the current value and stage of every deal"><div className="overflow-x-auto"><table className="n-table"><thead><tr><th>Opportunity</th><th>Customer</th><th>Value</th><th>Stage</th><th>Probability</th><th>Actions</th></tr></thead><tbody>{filteredDeals.map(d=><tr key={d.id}><td className="font-bold">{d.title}</td><td>{d.customer?.name||'—'}</td><td>{usd(d.value)}</td><td><Pill label={d.stage}/></td><td>{d.probability}%</td><td><button className="mr-3 font-semibold text-[#705fe5]" onClick={()=>openForm('deal',d)}>Edit</button><button className="font-semibold text-[#c47989]" onClick={()=>void remove('deal',d.id)}>Delete</button></td></tr>)}{!filteredDeals.length&&<tr><td colSpan={6} className="text-center">No opportunities found</td></tr>}</tbody></table></div></SectionCard>}</>}
+     {section==='Tasks'&&<><div className="mb-5 grid gap-4 md:grid-cols-3">{[['Pending tasks',tasks.filter(t=>t.status==='Todo').length],['In progress',tasks.filter(t=>t.status==='In Progress').length],['Overdue',overdue]].map(([name,value])=><div key={name} className="n-card flex items-center justify-between p-5"><div><p className="text-xs font-semibold text-slate-400">{name}</p><p className="mt-2 text-2xl font-extrabold">{value}</p></div><span className="rounded-xl bg-[#f0efff] p-3 text-[#7162e9]"><Icon name="clock"/></span></div>)}</div><div className="grid gap-5 lg:grid-cols-3">{(['Todo','In Progress','Done'] as const).map(status=>{const items=tasks.filter(t=>t.status===status);return <section key={status} className="rounded-2xl border border-[#e5e9f1] bg-[#edf1f7]/70 p-4"><div className="mb-4 flex items-center justify-between"><h3 className="flex items-center gap-2 text-sm font-bold"><span className={`h-2 w-2 rounded-full ${status==='Done'?'bg-emerald-400':status==='Todo'?'bg-slate-400':'bg-blue-400'}`}/>{status}</h3><span className="rounded-lg bg-white px-2 py-1 text-[11px] font-bold text-slate-400">{items.length}</span></div><div className="space-y-3">{items.map(t=><div className="rounded-xl border border-[#e5e9f0] bg-white p-4 shadow-sm" key={t.id}><div className="flex items-start justify-between gap-3"><p className="text-[13px] font-bold leading-5 text-[#304059]">{t.title}</p><button aria-label="Delete task" onClick={()=>void remove('task',t.id)} className="text-[#b1b8c6] hover:text-rose-500"><Icon name="close" size={15}/></button></div><p className="mt-2 truncate text-[11px] text-[#9ca5b3]">{t.customer?.name||'Internal workspace'}</p><div className="mt-4 flex items-center justify-between"><Pill label={t.priority}/><span className="flex items-center gap-1 text-[10px] text-[#9ea7b5]"><Icon name="calendar" size={12}/>{shortDate(t.dueAt)}</span></div><div className="mt-4 flex gap-2 border-t border-[#f1f2f6] pt-3"><select aria-label="Change task status" className="n-input min-w-0 flex-1" value={t.status} onChange={e=>void update(`/tasks/${t.id}`,{status:e.target.value})}>{['Todo','In Progress','Done'].map(s=><option key={s}>{s}</option>)}</select><button className="n-btn n-secondary" onClick={()=>openForm('task',t)}>Edit</button></div></div>)}{!items.length&&<div className="rounded-xl border border-dashed border-[#d6dce7] py-10 text-center text-xs text-[#a4adbc]">No tasks in this stage</div>}</div></section>})}</div></>}
+     {section==='Analytics'&&<><div className="mb-5 grid gap-4 sm:grid-cols-2 xl:grid-cols-4">{[['Customer activation',`${customers.length?Math.round((overview?.activeCustomers||0)/customers.length*100):0}%`],['Weighted forecast',compact(activeValue)],['Win rate',`${winRate}%`],['Tasks completed',`${taskProgress}%`]].map(([label,value])=><div key={label} className="n-card p-5"><p className="text-xs font-semibold text-slate-400">{label}</p><p className="mt-3 text-3xl font-extrabold text-slate-800">{value}</p></div>)}</div><div className="mb-5 flex justify-end"><label className="flex items-center gap-2 text-xs font-semibold text-slate-500">Time period <select className="n-input w-auto" value={period} onChange={e=>setPeriod(e.target.value as '6 months'|'3 months')}><option>6 months</option><option>3 months</option></select></label></div><div className="grid gap-5 xl:grid-cols-2"><SectionCard title="Revenue generated" caption="Closed-won opportunities by month"><div className="px-5 pb-5"><TrendChart data={monthly}/></div></SectionCard><SectionCard title="Customer acquisition" caption="New customer records created by month"><div className="px-5 pb-5"><TrendChart data={monthly} field="customers"/></div></SectionCard></div><div className="mt-5 grid gap-5 xl:grid-cols-[1.3fr_1fr]"><SectionCard title="Conversion funnel" caption="Current distribution of CRM deals"><div className="space-y-4 px-6 pb-6">{stages.map(s=>{const n=deals.filter(d=>d.stage===s).length;return <div key={s} className="flex items-center gap-3"><div className="w-24 text-xs font-semibold text-slate-600">{s}</div><div className="h-3 flex-1 overflow-hidden rounded-full bg-[#f0f2f7]"><div className="h-full rounded-full" style={{width:`${deals.length?n/deals.length*100:0}%`,background:stageColors[s]}}/></div><span className="w-7 text-right text-xs font-bold">{n}</span></div>})}</div></SectionCard><SectionCard title="Operational health" caption="Live indicators based on CRM records"><div className="space-y-5 px-6 pb-6">{[['Customer activation',customers.length?(overview?.activeCustomers||0)/customers.length*100:0],['Tasks completed',taskProgress],['Deal win rate',winRate]].map(([label,value])=><div key={label}><div className="mb-2 flex justify-between text-xs"><span className="font-semibold text-slate-600">{label}</span><span className="font-extrabold">{Math.round(Number(value))}%</span></div><div className="h-2 rounded-full bg-[#eef1f7]"><div className="h-2 rounded-full bg-gradient-to-r from-[#8c80f5] to-[#5d6bea]" style={{width:`${Number(value)}%`}}/></div></div>)}<p className="rounded-xl bg-[#f7f8fc] p-3 text-[11px] leading-5 text-[#929bab]">All metrics are computed from your current organization’s CRM records. Historical revenue uses the date a deal was last updated to Won.</p></div></SectionCard></div></>}
+    </>}
+    <footer className="mt-9 flex flex-wrap items-center justify-between gap-3 border-t border-[#e5eaf1] py-5 text-[11px] text-[#9ba5b5]"><span>© {new Date().getFullYear()} Nexora Signature · Enterprise Workspace</span><span>Next.js · React · Tailwind · Express · TypeScript · Prisma · PostgreSQL</span></footer>
+   </main>
+  </div>
+  {commandOpen&&<div className="n-spotlight fixed inset-0 z-[110] flex justify-center bg-[#08152b]/70 px-4 pt-[10vh] backdrop-blur-[5px]" onMouseDown={e=>{if(e.target===e.currentTarget)setCommandOpen(false)}}><section role="dialog" aria-modal="true" aria-label="Search Nexora workspace" className="h-fit w-full max-w-[620px] overflow-hidden rounded-[22px] border border-white/40 bg-white shadow-[0_35px_100px_#08152b55]"><div className="flex items-center gap-3 border-b border-[#e9ecf2] px-5 py-4"><Icon name="search" size={21} className="text-[#7464e4]"/><input autoFocus className="min-w-0 flex-1 bg-transparent text-sm text-[#26344c] outline-none placeholder:text-[#9aa3b2]" placeholder="Search pages, customers, deals and tasks…" value={commandQuery} onChange={e=>setCommandQuery(e.target.value)}/><button aria-label="Close search" onClick={()=>setCommandOpen(false)} className="rounded-lg bg-[#f0f2f7] px-2 py-1 text-[10px] font-bold text-[#8691a6]">ESC</button></div><div className="max-h-[390px] overflow-y-auto p-3"><p className="px-3 pb-2 pt-1 text-[10px] font-extrabold uppercase tracking-[.17em] text-[#a2aabc]">{commandQuery?'Matching results':'Quick navigation'}</p>{commandResults.map(result=><button key={result.key} className="n-command-item flex w-full items-center gap-3 rounded-xl px-3 py-3 text-left" onClick={()=>{setCommandOpen(false);if(result.kind==='page')switchSection(result.id as Section);else{switchSection(result.kind==='customer'?'Customers':result.kind==='deal'?'Pipeline':'Tasks');setQuery(result.title)}}}><span className="grid h-10 w-10 place-items-center rounded-xl bg-[#f1efff] text-[#7568dc]"><Icon name={result.kind==='page'?'grid':result.kind==='customer'?'users':result.kind==='deal'?'briefcase':'tasks'}/></span><span className="min-w-0 flex-1"><span className="block truncate text-[13px] font-bold text-[#293752]">{result.title}</span><span className="mt-0.5 block truncate text-[11px] text-[#949fb0]">{result.detail}</span></span><span className="text-[10px] font-semibold uppercase tracking-widest text-[#a7afbd]">{result.kind}</span></button>)}{!commandResults.length&&<p className="px-3 py-12 text-center text-sm text-[#9ba5b6]">No matching records found</p>}</div><div className="flex items-center justify-between border-t border-[#edf0f5] bg-[#fafbfe] px-5 py-3 text-[10px] text-[#9aa4b3]"><span>Results from your organization workspace</span><span>Ctrl K · Search</span></div></section></div>}
+  {modal&&<div className="fixed inset-0 z-[100] flex items-center justify-center bg-[#111a30]/65 p-4" onMouseDown={e=>{if(e.target===e.currentTarget)setModal(null)}}><section role="dialog" aria-modal="true" aria-label={`${editing?'Edit':'New'} ${modal}`} className="w-full max-w-lg rounded-3xl bg-white p-6 shadow-2xl md:p-8"><div className="mb-6 flex items-start justify-between"><div><div className="text-[10px] font-bold uppercase tracking-widest text-[#7462e6]">Nexora workspace</div><h2 className="mt-2 text-xl font-extrabold text-[#1f2d46]">{editing?'Edit':'Create'} {modal}</h2><p className="mt-1 text-xs text-[#98a3b2]">Saved securely to PostgreSQL for your organization.</p></div><button aria-label="Close dialog" onClick={()=>setModal(null)} className="rounded-lg p-2 text-slate-500 hover:bg-slate-100"><Icon name="close"/></button></div>{error&&<div role="alert" className="mb-4 rounded-lg bg-rose-50 p-3 text-xs text-rose-700">{error}</div>}<form onSubmit={e=>{e.preventDefault();void save()}} className="n-scroll max-h-[65vh] space-y-4 overflow-y-auto pr-2">{(modal==='customer'?['name','company','email','phone','status','industry']:modal==='deal'?['title','customerId','value','stage','probability']:['title','customerId','priority','status','dueAt']).map(key=><label key={key} className="block"><span className="mb-1.5 block text-[11px] font-bold capitalize text-[#536078]">{key==='customerId'?'Customer':key==='dueAt'?'Due date':key.replace(/([A-Z])/g,' $1')}</span>{['status','stage','priority','customerId'].includes(key)?<select className="n-input" value={form[key]||''} onChange={e=>setForm({...form,[key]:e.target.value})}>{key==='customerId'&&<option value="">{modal==='task'?'No customer':'Choose a customer'}</option>}{(key==='customerId'?customers.map(c=>[c.id,`${c.name} · ${c.company}`]):key==='stage'?stages.map(s=>[s,s]):key==='priority'?['Low','Medium','High'].map(s=>[s,s]):(modal==='customer'?['Lead','Active','At Risk']:['Todo','In Progress','Done']).map(s=>[s,s])).map(([val,label])=><option value={val} key={val}>{label}</option>)}</select>:<input className="n-input" required={['name','email','title'].includes(key)} type={key==='email'?'email':key==='dueAt'?'date':['value','probability'].includes(key)?'number':'text'} min={['value','probability'].includes(key)?0:undefined} max={key==='probability'?100:undefined} value={key==='dueAt'&&form[key]?form[key].slice(0,10):form[key]||''} onChange={e=>setForm({...form,[key]:e.target.value})}/>}</label>)}<div className="flex justify-end gap-2 border-t border-[#f0f2f5] pt-5"><button type="button" onClick={()=>setModal(null)} className="n-btn n-secondary">Cancel</button><button disabled={saving} type="submit" className="n-btn n-primary">{saving?'Saving…':'Save changes'} <Icon name="arrow" size={14}/></button></div></form></section></div>}
+ </div>;
+}

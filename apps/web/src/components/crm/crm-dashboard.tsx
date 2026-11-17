@@ -1,7 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
-import { useRouter } from 'next/navigation';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { authClient, useSession, useActiveOrganization, useListOrganizations } from '@/lib/auth-client';
 
 type Customer = { id: string; name: string; company: string; email: string; phone: string; status: string; industry: string; createdAt: string };
@@ -64,36 +63,50 @@ function Avatar({name,index=0}:{name:string;index?:number}) {return <span classN
 function csvDownload(filename:string,rows:(string|number)[][]) {const text=rows.map(r=>r.map(c=>`"${String(c??'').replace(/"/g,'""')}"`).join(',')).join('\r\n');const url=URL.createObjectURL(new Blob(['\ufeff',text],{type:'text/csv;charset=utf-8;'}));const anchor=document.createElement('a');anchor.href=url;anchor.download=filename;anchor.click();URL.revokeObjectURL(url)}
 
 export function CrmDashboard():React.ReactNode {
- const router=useRouter();
- const {data:session,isPending,refetch:refetchSession}=useSession();
+ const {data:session,isPending}=useSession();
   const {data:activeOrg,isPending:orgPending,refetch:refetchActiveOrganization}=useActiveOrganization();
   const {data:availableOrgs,isPending:orgsPending}=useListOrganizations();
   const [switchingOrg,setSwitchingOrg]=useState(false);
-  // NEXORA_ORG_SWITCH_REPAIR_V2
-  const switchOrganization=async (organizationId:string)=>{
-    if (!organizationId || organizationId===activeOrg?.id || switchingOrg) return;
-    if (!availableOrgs?.some(org=>org.id===organizationId)) {
-      setError('You do not have access to that organization.');
+  // Keep the current authentication session. A transiently empty activeOrg
+  // must never trigger a navigation to /login or /onboarding.
+  const switchingRef = useRef(false);
+  const requestVersion = useRef(0);
+  const [desiredOrgId, setDesiredOrgId] = useState<string | null>(null);
+  const switchOrganization = async (organizationId: string) => {
+    if (!organizationId || switchingRef.current) return;
+    if (!availableOrgs?.some(org => org.id === organizationId)) {
+      setToast('');
+      setError('This account is not a member of the selected workspace.');
       return;
     }
+    if (organizationId === activeOrg?.id && !desiredOrgId) return;
+
+    switchingRef.current = true;
+    requestVersion.current += 1;
     setSwitchingOrg(true);
     setError('');
+    setToast('');
+    setDesiredOrgId(organizationId);
+    setOverview(null);
+    setCustomers([]);
+    setDeals([]);
+    setTasks([]);
+    setLoading(true);
     try {
-      const result=await authClient.organization.setActive({organizationId});
-      if (result.error) throw new Error(result.error.message||'Could not switch workspace');
-      setOverview(null);
-      setCustomers([]);
-      setDeals([]);
-      setTasks([]);
+      const result = await authClient.organization.setActive({ organizationId });
+      if (result.error) throw new Error(result.error.message || 'Unable to select workspace');
+      // Refresh only organization state. Never force a browser reload or sign-out.
+      // If the hook briefly becomes null, keep the dashboard mounted.
+      await refetchActiveOrganization();
       setQuery('');
       setCustomerStatus('All');
       setDealStage('All');
-      await Promise.all([refetchSession(),refetchActiveOrganization()]);
-      setToast('Workspace switched successfully');
-      // Existing effect reloads org-scoped CRM data when activeOrg.id changes.
-    } catch(e) {
-      setError(e instanceof Error?e.message:'Could not switch workspace');
+      setToast('Workspace selection saved');
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Unable to select workspace');
+      setDesiredOrgId(null);
     } finally {
+      switchingRef.current = false;
       setSwitchingOrg(false);
     }
   };
@@ -133,10 +146,40 @@ export function CrmDashboard():React.ReactNode {
  },[]);
  const apiBase=process.env.NEXT_PUBLIC_API_URL||'http://localhost:4000';
  const request=useCallback(async(path:string,opts?:RequestInit)=>{const response=await fetch(`${apiBase}/api/crm${path}`,{...opts,cache: 'no-store',credentials:'include',headers:{'Content-Type':'application/json',...(opts?.headers||{})}});const payload=await response.json().catch(()=>({error:`HTTP ${response.status}`}));if(!response.ok)throw new Error(payload.error||payload.message||`HTTP ${response.status}`);return payload.data;},[apiBase]);
- const reload=useCallback(async()=>{setLoading(true);setError('');try{const [o,c,d,t]=await Promise.all([request('/overview'),request('/customers'),request('/deals'),request('/tasks')]);setOverview(o);setCustomers(c);setDeals(d);setTasks(t)}catch(e){setError(e instanceof Error?e.message:'Could not load workspace')}finally{setLoading(false)}},[request]);
- useEffect(()=>{if(!isPending&&!session?.user)router.replace('/login')},[isPending,session,router]);
- useEffect(()=>{if(!orgPending&&!switchingOrg&&session?.user&&!activeOrg)router.replace('/onboarding')},[orgPending,switchingOrg,session,activeOrg,router]);
- useEffect(()=>{if(session?.user&&activeOrg?.id)void reload()},[session?.user?.id,activeOrg?.id,reload]);
+ const reload = useCallback(async () => {
+   const version = ++requestVersion.current;
+   setLoading(true);
+   setError('');
+   try {
+     const [o, c, d, t] = await Promise.all([
+       request('/overview'),
+       request('/customers'),
+       request('/deals'),
+       request('/tasks'),
+     ]);
+     // Do not mix data returned by an earlier organization with the new one.
+     if (version !== requestVersion.current) return;
+     setOverview(o);
+     setCustomers(c);
+     setDeals(d);
+     setTasks(t);
+   } catch (e) {
+     if (version === requestVersion.current) {
+       setError(e instanceof Error ? e.message : 'Could not load workspace');
+     }
+   } finally {
+     if (version === requestVersion.current) setLoading(false);
+   }
+ }, [request]);
+ // Never redirect during organization switching. If auth briefly revalidates,
+ // the user sees a stable recovery state rather than a login/onboarding loop.
+ useEffect(() => {
+   if (!switchingOrg && session?.user && activeOrg?.id &&
+       (!desiredOrgId || activeOrg.id === desiredOrgId)) {
+     if (desiredOrgId) setDesiredOrgId(null);
+     void reload();
+   }
+ }, [switchingOrg, session?.user?.id, activeOrg?.id, desiredOrgId, reload]);
  const filteredCustomers=useMemo(()=>customers.filter(c=>(customerStatus==='All'||c.status===customerStatus)&&`${c.name} ${c.company} ${c.email} ${c.industry}`.toLowerCase().includes(query.toLowerCase())),[customers,customerStatus,query]);
  const filteredDeals=useMemo(()=>deals.filter(d=>(dealStage==='All'||d.stage===dealStage)&&`${d.title} ${d.customer?.name||''} ${d.customer?.company||''}`.toLowerCase().includes(query.toLowerCase())),[deals,dealStage,query]);
  const activeValue=deals.filter(d=>!['Won','Lost'].includes(d.stage)).reduce((sum,d)=>sum+d.value*d.probability/100,0);
@@ -166,7 +209,9 @@ export function CrmDashboard():React.ReactNode {
  const remove=async(type:FormKind,id:string)=>{if(!window.confirm(`Delete this ${type}? This action cannot be undone.`))return;try{await request(`/${type}s/${id}`,{method:'DELETE'});setToast(`${type} deleted`);await reload()}catch(e){setError(e instanceof Error?e.message:'Delete failed')}};
  const seed=async()=>{setSeeding(true);setError('');try{await request('/seed-demo',{method:'POST'});setToast('Sample CRM records added');await reload()}catch(e){setError(e instanceof Error?e.message:'Seed failed')}finally{setSeeding(false)}};
  const exportSection=()=>{const name=`nexora-${section.toLowerCase()}-${new Date().toISOString().slice(0,10)}.csv`;if(section==='Customers')csvDownload(name,[['Name','Company','Email','Phone','Industry','Status'],...filteredCustomers.map(c=>[c.name,c.company,c.email,c.phone,c.industry,c.status])]);else if(section==='Pipeline')csvDownload(name,[['Opportunity','Customer','Value (USD)','Stage','Probability (%)'],...filteredDeals.map(d=>[d.title,d.customer?.name||'',d.value,d.stage,d.probability])]);else if(section==='Tasks')csvDownload(name,[['Task','Customer','Priority','Status','Due date'],...tasks.map(t=>[t.title,t.customer?.name||'',t.priority,t.status,t.dueAt||''])]);else csvDownload(name,[['Metric','Value'],['Total customers',overview?.customers||0],['Pipeline value',overview?.pipelineValue||0],['Weighted pipeline',Math.round(activeValue)],['Won revenue',overview?.wonRevenue||0],['Win rate',`${winRate}%`]]);setToast('CSV report downloaded')};
- if(isPending||orgPending||switchingOrg||!session?.user||!activeOrg)return <div className="flex min-h-screen items-center justify-center bg-[#f6f8fc] text-slate-600">Opening your workspace…</div>;
+ if (isPending || orgPending || switchingOrg) return <div className="flex min-h-screen items-center justify-center bg-[#f6f8fc] text-slate-600">Checking your session and workspace…</div>;
+ if (!session?.user) return <div className="flex min-h-screen flex-col items-center justify-center gap-4 bg-[#f6f8fc] text-slate-700"><p>Session could not be confirmed. Your account has not been deleted.</p><button className="rounded-lg bg-indigo-600 px-4 py-2 text-white" onClick={() => window.location.assign('/login')}>Open sign in</button></div>;
+ if (!activeOrg || desiredOrgId) return <div className="flex min-h-screen items-center justify-center bg-[#f6f8fc] p-6"><div className="w-full max-w-md rounded-2xl border bg-white p-6 shadow-sm"><h2 className="mb-2 text-lg font-bold text-slate-800">Select your workspace</h2><p className="mb-4 text-sm text-slate-500">Your session is still active. Select an existing organization; no new organization is needed.</p>{error && <p className="mb-3 text-sm text-red-600">{error}</p>}{desiredOrgId && <p className="mb-3 text-sm text-slate-500">Synchronizing workspace…</p>}<div className="space-y-2">{(availableOrgs || []).map(org => <button key={org.id} disabled={switchingOrg} onClick={() => void switchOrganization(org.id)} className="block w-full rounded-xl border px-4 py-3 text-left text-sm font-semibold text-slate-700 hover:bg-slate-50">{org.name}</button>)}</div><button className="mt-4 text-xs text-indigo-700 underline" onClick={() => { setDesiredOrgId(null); void refetchActiveOrganization(); }}>Retry loading active workspace</button></div></div>;
  const kpis=[{name:'Total customers',value:nf(overview?.customers||0),detail:`${nf(overview?.activeCustomers||0)} active relationships`,icon:'users' as IconName,color:'violet',label:'Customer growth'},{name:'Open pipeline',value:compact(overview?.pipelineValue||0),detail:`${overview?.openDeals||0} live opportunities`,icon:'briefcase' as IconName,color:'blue',label:'Revenue potential'},{name:'Revenue won',value:compact(overview?.wonRevenue||0),detail:`${won} successfully closed`,icon:'trending' as IconName,color:'green',label:'Closed-won revenue'},{name:'Team execution',value:`${taskProgress}%`,detail:`${completed} of ${tasks.length} tasks completed`,icon:'check' as IconName,color:'orange',label:'Task completion'}];
  return <div data-accent={accent} className={`nexora-shell nexora-signature min-h-screen bg-[#f5f7fb] text-slate-800 ${focusMode?'n-focus-mode':''} ${compactLayout?'n-compact':''}`}>
   <style>{`
